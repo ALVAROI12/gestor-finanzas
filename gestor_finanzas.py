@@ -63,7 +63,7 @@ def populate_base_data(conn):
     # Gastos fijos
     cur.execute(
         "INSERT INTO expenses (category, amount) VALUES (?, ?)",
-        ("Gasto Fijo Mensual", 4450.0)
+        ("Gasto Fijo Mensual", 2600.0)
     )
 
     # Deudas
@@ -85,9 +85,10 @@ def populate_base_data(conn):
 
     # Bolsillos de ahorro
     savings = [
-        ("CAR",    570.0,  3840.0),
-        ("RENT",   800.0,  9600.0),
-        ("INVEST",1276.0,     None),
+        ("CAR",      570.0,  6840.0),
+        ("RENT",     800.0,  9600.0),
+        ("INVEST",  1276.0,  5000.0),
+        ("Savings",  100.0,  20000.0),
     ]
     cur.executemany(
         "INSERT INTO savings_pockets (name, current_balance, target_amount) VALUES (?, ?, ?)",
