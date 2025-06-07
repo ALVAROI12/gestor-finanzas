@@ -11,19 +11,28 @@ import pandas as pd
 
 # --- Inicializar Firestore SOLO desde Secrets ---
 if "db" not in st.session_state:
-    # Leer la sección FIREBASE_KEY de st.secrets como dict puro
+    # 1) Leer la sección FIREBASE_KEY de st.secrets
     svc_raw = st.secrets["FIREBASE_KEY"]
-    svc_dict = dict(svc_raw)          # convierte SecretMap a dict nativo
-    # Si alguna clave viene serializada como JSON string, deserializa:
-    for k, v in svc_dict.items():
-        if isinstance(v, str) and v.strip().startswith("{"):
-            try:
-                svc_dict[k] = json.loads(v)
-            except:
-                pass
-    cred = credentials.Certificate(svc_dict)
-    firebase_admin.initialize_app(cred)
-    st.session_state.db = firestore.client()
+    svc_dict = dict(svc_raw)  # convierte SecretMap a dict nativo
+
+    # 2) Limpieza de la clave privada
+    pk = svc_dict.get("private_key", "")
+    # Asegura que tenga saltos de línea correctos y sin indentación
+    pk = pk.strip()
+    # En caso de que venga con literales "\n", reemplázalos
+    pk = pk.replace("\\n", "\n")
+    svc_dict["private_key"] = pk
+
+    # 3) Inicializar credenciales
+    try:
+        cred = credentials.Certificate(svc_dict)
+        firebase_admin.initialize_app(cred)
+        st.session_state.db = firestore.client()
+    except Exception as e:
+        st.error("❌ Error inicializando Firestore:")
+        st.error(e)
+        st.stop()
+
 db = st.session_state.db
 
 # --- Configuración de la página ---
@@ -51,12 +60,14 @@ def allocate_income(amount: float):
         "date": today, "amount": amount, "source": "Real"
     })
     inc_id = inc_ref[1].id
+
     # 2) Cubrir gastos fijos
     spent_fixed = sum(a.to_dict().get("to_expenses",0.0)
                       for a in db.collection("allocations").stream())
     to_exp = min(amount, FIXED_MONTHLY_META - spent_fixed) \
              if spent_fixed < FIXED_MONTHLY_META else 0.0
     rem = amount - to_exp
+
     # 3) Ahorros (70% del sobrante)
     to_sav = rem * 0.70
     sav_dep = {}
@@ -78,8 +89,10 @@ def allocate_income(amount: float):
                 "current_balance": firestore.Increment(pay)
             })
         sav_dep[name] = pay
+
     used_sav = sum(sav_dep.values())
     debt_pool = rem * 0.30 + (to_sav - used_sav)
+
     # 4) Pago a Upstart (límite mensual)
     paid_up = sum(a.to_dict().get("to_upstart",0.0)
                   for a in db.collection("allocations").stream())
@@ -93,6 +106,7 @@ def allocate_income(amount: float):
             "total_balance": firestore.Increment(-up_pay)
         })
     debt_left = debt_pool - up_pay
+
     # 5) Resto de deudas (filtrado en Python)
     all_debts = db.collection("debts").stream()
     debt_docs = [
@@ -110,6 +124,7 @@ def allocate_income(amount: float):
                 "total_balance": firestore.Increment(-pay)
             })
         debt_dep[data["name"]] = pay
+
     # 6) Guardar allocation con detalles
     db.collection("allocations").add({
         "income_id":        inc_id,
@@ -130,6 +145,7 @@ def main():
     st.title("🗂️ Gestor de Finanzas Semanales")
     mes = MONTH_NAMES[(st.session_state.month_idx-1)%12]
     st.markdown(f"## Mes: **{mes}**")
+
     if st.sidebar.button("Iniciar Nuevo Mes"):
         for a in db.collection("allocations").stream():
             db.collection("allocations").document(a.id).delete()
