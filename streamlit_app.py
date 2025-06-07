@@ -2,228 +2,238 @@
 # streamlit_app.py
 
 import os
-import sqlite3
 from datetime import datetime
 
-import pandas as pd
 import streamlit as st
+import firebase_admin
+from firebase_admin import credentials, firestore
+from google.cloud.firestore_v1.base_query import FieldFilter
+import pandas as pd
 
-# --- Configuración página ---
+# --- Inicializar Firestore ---
+if "db" not in st.session_state:
+    # En producción: usamos la clave en st.secrets
+    if "FIREBASE_KEY" in st.secrets:
+        cred = credentials.Certificate(st.secrets["FIREBASE_KEY"])
+    else:
+        # Para desarrollo local - asegúrate de ignorar este archivo en git
+        key_path = os.path.join(os.getcwd(), "serviceAccount.json")
+        cred = credentials.Certificate(key_path)
+    firebase_admin.initialize_app(cred)
+    st.session_state.db = firestore.client()
+db = st.session_state.db
+
+# --- Configuración de la página ---
 st.set_page_config(page_title="Gestor de Finanzas Semanales", layout="wide")
 
-DB_PATH = os.path.join(os.getcwd(), "gestor_finanzas.db")
-FIXED_MONTHLY_META = 2600.0      # según tabla expenses
-UPSTART_MONTHLY_LIMIT = 275.0    # tope mensual para Upstart
+# Constantes
+FIXED_MONTHLY_META    = 2600.0
+UPSTART_MONTHLY_LIMIT = 275.0
 MONTH_NAMES = [
     "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
     "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"
 ]
-# pesos sobre el 70% sobrante
 SAVINGS_WEIGHTS = {
-    "RENT":     0.40,  # hasta target
-    "CAR":      0.30,  # hasta target
-    "Savings":  0.20,  # sin límite
-    "INVEST":   0.10,  # sin límite
+    "RENT":    0.40,
+    "CAR":     0.30,
+    "Savings": 0.20,
+    "INVEST":  0.10
 }
 
-def get_connection():
-    return sqlite3.connect(DB_PATH)
-
 def format_money(x):
-    return f"${x:,.2f}"
+    """Formatea un número o string como moneda."""
+    try:
+        n = float(x)
+    except:
+        return ""
+    return f"${n:,.2f}"
 
-def allocate_income(conn, income_amount):
-    cur = conn.cursor()
+def allocate_income(amount: float):
+    """
+    Registra un ingreso y reparte:
+      1) Gastos fijos hasta FIXED_MONTHLY_META
+      2) Ahorros 70% sobrante según SAVINGS_WEIGHTS
+      3) Deudas: Upstart hasta 275/mes, resto proporcional
+    Guarda además 'debt_details' en allocations.
+    """
     today = datetime.now().strftime("%Y-%m-%d")
 
     # 1) Registrar ingreso
-    cur.execute(
-        "INSERT INTO incomes (date, amount, source) VALUES (?, ?, ?)",
-        (today, income_amount, "Real")
-    )
-    inc_id = cur.lastrowid
+    inc_ref = db.collection("incomes").add({
+        "date": today,
+        "amount": amount,
+        "source": "Real"
+    })
+    inc_id = inc_ref[1].id
 
-    # 2) Gasto fijo acumulado
-    spent_fixed = cur.execute(
-        "SELECT COALESCE(SUM(to_expenses),0) FROM allocations"
-    ).fetchone()[0]
+    # 2) Cubrir gastos fijos
+    spent_fixed = sum(a.to_dict().get("to_expenses", 0.0)
+                      for a in db.collection("allocations").stream())
+    to_exp = min(amount, FIXED_MONTHLY_META - spent_fixed) \
+             if spent_fixed < FIXED_MONTHLY_META else 0.0
+    rem = amount - to_exp
 
-    # Cubrir gasto fijo hasta 2600
-    if spent_fixed < FIXED_MONTHLY_META:
-        to_expenses = min(income_amount, FIXED_MONTHLY_META - spent_fixed)
-    else:
-        to_expenses = 0.0
-    remainder = income_amount - to_expenses
-
-    # 3) Ahorros: 70% del sobrante
-    to_savings = remainder * 0.70
-    sav_deposits = {}
+    # 3) Ahorros (70% del sobrante)
+    to_sav = rem * 0.70
+    sav_dep = {}
     for name, weight in SAVINGS_WEIGHTS.items():
-        pid, bal, tgt = cur.execute(
-            "SELECT id, current_balance, target_amount FROM savings_pockets WHERE name = ?",
-            (name,)
-        ).fetchone()
-        alloc = to_savings * weight
+        alloc = to_sav * weight
+        docs = list(db.collection("savings_pockets")
+                    .where(filter=FieldFilter("name", "==", name))
+                    .stream())
+        if not docs:
+            continue
+        ref = docs[0]
+        data = ref.to_dict()
+        bal = float(data.get("current_balance", 0.0))
+        tgt = data.get("target_amount")
         if name in ("Savings", "INVEST"):
-            # sin límite: siempre recibe su parte
             pay = alloc
         else:
-            # respeta target
-            needed = max((tgt or 0.0) - bal, 0.0)
-            pay = min(alloc, needed)
+            need = max((tgt or 0.0) - bal, 0.0)
+            pay = min(alloc, need)
         if pay > 0:
-            cur.execute(
-                "UPDATE savings_pockets SET current_balance = current_balance + ? WHERE id = ?",
-                (pay, pid)
-            )
-        sav_deposits[name] = pay
+            db.collection("savings_pockets").document(ref.id).update({
+                "current_balance": firestore.Increment(pay)
+            })
+        sav_dep[name] = pay
 
-    used_sav = sum(sav_deposits.values())
-    debt_pool = remainder * 0.30 + (to_savings - used_sav)
+    used_sav = sum(sav_dep.values())
+    debt_pool = rem * 0.30 + (to_sav - used_sav)
 
-    # 4) Deudas: Upstart mensual hasta 275, luego proporcional
-    paid_up_month = cur.execute(
-        "SELECT COALESCE(SUM(to_upstart),0) FROM allocations"
-    ).fetchone()[0]
-    avail_up = max(UPSTART_MONTHLY_LIMIT - paid_up_month, 0.0)
+    # 4) Pago a Upstart (límite mensual)
+    paid_up = sum(a.to_dict().get("to_upstart", 0.0)
+                  for a in db.collection("allocations").stream())
+    avail_up = max(UPSTART_MONTHLY_LIMIT - paid_up, 0.0)
     up_pay = min(avail_up, debt_pool)
-    cur.execute(
-        "UPDATE debts SET min_payment = ?, total_balance = total_balance - ? WHERE name = 'Upstart'",
-        (up_pay, up_pay)
-    )
+    up_docs = list(db.collection("debts")
+                   .where(filter=FieldFilter("name", "==", "Upstart"))
+                   .stream())
+    if up_docs:
+        db.collection("debts").document(up_docs[0].id).update({
+            "total_balance": firestore.Increment(-up_pay)
+        })
     debt_left = debt_pool - up_pay
 
-    rows = cur.execute(
-        "SELECT id, name, total_balance FROM debts WHERE name != 'Upstart' AND total_balance > 0"
-    ).fetchall()
-    total_bal = sum(r[2] for r in rows)
-    debt_deposits = {"Upstart": up_pay}
-    for did, name, bal in rows:
+    # 5) Resto de deudas (filtrado en Python)
+    all_debts = db.collection("debts").stream()
+    debt_docs = [
+        d for d in all_debts
+        if d.to_dict().get("name") != "Upstart"
+           and float(d.to_dict().get("total_balance", 0.0)) > 0.0
+    ]
+    total_bal = sum(float(d.to_dict().get("total_balance", 0.0)) for d in debt_docs)
+    debt_dep = {"Upstart": up_pay}
+    for ref in debt_docs:
+        data = ref.to_dict()
+        bal = float(data["total_balance"])
         pay = min((bal / total_bal) * debt_left if total_bal > 0 else 0.0, bal)
         if pay > 0:
-            cur.execute(
-                "UPDATE debts SET min_payment = ?, total_balance = total_balance - ? WHERE id = ?",
-                (pay, pay, did)
-            )
-        debt_deposits[name] = pay
+            db.collection("debts").document(ref.id).update({
+                "total_balance": firestore.Increment(-pay)
+            })
+        debt_dep[data["name"]] = pay
 
-    # 5) Guardar allocation
-    car_pay    = sav_deposits.get("CAR", 0.0)
-    rent_pay   = sav_deposits.get("RENT", 0.0)
-    inv_pay    = sav_deposits.get("INVEST", 0.0)
-    other_sav  = sav_deposits.get("Savings", 0.0)
+    # 6) Guardar allocation con detalles
+    db.collection("allocations").add({
+        "income_id":        inc_id,
+        "to_expenses":      to_exp,
+        "to_upstart":       up_pay,
+        "to_debts":         sum(v for k, v in debt_dep.items() if k != "Upstart"),
+        "to_savings_car":    sav_dep.get("CAR", 0.0),
+        "to_savings_rent":   sav_dep.get("RENT", 0.0),
+        "to_savings_invest": sav_dep.get("INVEST", 0.0),
+        "to_other":          sav_dep.get("Savings", 0.0),
+        "debt_details":     debt_dep
+    })
 
-    cur.execute("""
-        INSERT INTO allocations (
-            income_id, to_expenses, to_upstart, to_debts,
-            to_savings_car, to_savings_rent, to_savings_invest, to_other
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        inc_id,
-        to_expenses,
-        up_pay,
-        sum(v for k, v in debt_deposits.items() if k != "Upstart"),
-        car_pay,
-        rent_pay,
-        inv_pay,
-        other_sav
-    ))
-    conn.commit()
-
-    return {
-        "Gasto Fijo": to_expenses,
-        **sav_deposits,
-        "Pago Deudas": up_pay + sum(v for k, v in debt_deposits.items() if k != "Upstart"),
-        "Detalles Deudas": debt_deposits
-    }
+    return to_exp, sav_dep, debt_dep
 
 def main():
-    # Estado de mes (inicia en mes actual)
+    # Control de mes actual
     if "month_idx" not in st.session_state:
         st.session_state.month_idx = datetime.now().month
 
-    conn = get_connection()
     st.title("🗂️ Gestor de Finanzas Semanales")
-
-    # Mostrar mes
     mes = MONTH_NAMES[(st.session_state.month_idx - 1) % 12]
     st.markdown(f"## Mes: **{mes}**")
 
-    # Iniciar Nuevo Mes
+    # Botón: iniciar nuevo mes
     if st.sidebar.button("Iniciar Nuevo Mes"):
+        for a in db.collection("allocations").stream():
+            db.collection("allocations").document(a.id).delete()
         st.session_state.month_idx = (st.session_state.month_idx % 12) + 1
-        conn.execute("DELETE FROM allocations")
-        conn.commit()
-        st.sidebar.success(f"✅ Reiniciado a {MONTH_NAMES[st.session_state.month_idx-1]}")
+        st.sidebar.success(f"✅ Mes reiniciado a {MONTH_NAMES[st.session_state.month_idx-1]}")
 
-    # Ingreso semanal
-    income_amt = st.sidebar.number_input("Monto recibido esta semana", min_value=0.0, step=10.0)
+    # Input y distribución
+    inc = st.sidebar.number_input("Monto recibido esta semana", min_value=0.0, step=10.0)
     if st.sidebar.button("Distribuir Ingreso"):
-        res = allocate_income(conn, income_amt)
-        st.sidebar.success("🔄 Distribución ejecutada:")
-        for k, v in res.items():
-            if k != "Detalles Deudas":
-                st.sidebar.write(f"- **{k}**: {format_money(v)}")
-        st.sidebar.write("**Por Tarjeta:**")
-        for nm, pay in res["Detalles Deudas"].items():
-            st.sidebar.write(f"  - {nm}: {format_money(pay)}")
+        to_exp, sav_dep, debt_dep = allocate_income(inc)
+        st.sidebar.write(f"- **Gasto Fijo**: {format_money(to_exp)}")
+        for k, v in sav_dep.items():
+            st.sidebar.write(f"- **Ahorro {k}**: {format_money(v)}")
+        st.sidebar.write(f"- **Pago Deudas Total**: {format_money(sum(v for k, v in debt_dep.items() if k!='Upstart'))}")
+        st.sidebar.write("**Detalle Deudas:**")
+        for k, v in debt_dep.items():
+            st.sidebar.write(f"  - {k}: {format_money(v)}")
 
-    # 📌 Gastos Fijos
-    st.subheader("📌 Gastos Fijos")
-    spent = conn.execute("SELECT COALESCE(SUM(to_expenses),0) FROM allocations").fetchone()[0]
-    last = conn.execute("SELECT to_expenses FROM allocations ORDER BY id DESC LIMIT 1").fetchone()
-    last_exp = last[0] if last else 0.0
+    # 📌 GASTOS FIJOS
+    st.subheader("📌 GASTOS FIJOS")
+    allocs = list(db.collection("allocations").stream())
+    spent = sum(a.to_dict().get("to_expenses", 0.0) for a in allocs)
+    last_exp = allocs[-1].to_dict().get("to_expenses", 0.0) if allocs else 0.0
     falt = max(FIXED_MONTHLY_META - spent, 0.0)
     df_fixed = pd.DataFrame([{
-        "Descripción":       "Gasto Fijo Mensual",
-        "Monto Meta":        FIXED_MONTHLY_META,
-        "Dinero Actual":     spent,
-        "Último Depósito":   last_exp,
-        "Faltante":          falt
+        "Descripción":     "Gasto Fijo Mensual",
+        "Monto Meta":      FIXED_MONTHLY_META,
+        "Dinero Actual":   spent,
+        "Último Depósito": last_exp,
+        "Faltante":        falt
     }])
-    for c in df_fixed.columns[1:]:
-        df_fixed[c] = df_fixed[c].map(format_money)
+    for col in df_fixed.columns[1:]:
+        df_fixed[col] = df_fixed[col].map(format_money)
     st.table(df_fixed)
 
-    # 💰 Ahorros
-    st.subheader("💰 Ahorros")
-    last_vals = conn.execute(
-        "SELECT to_savings_car, to_savings_rent, to_savings_invest, to_other "
-        "FROM allocations ORDER BY id DESC LIMIT 1"
-    ).fetchone() or (0.0, 0.0, 0.0, 0.0)
-
+    # 💰 AHORROS
+    st.subheader("💰 AHORROS")
+    last_vals = allocs[-1].to_dict() if allocs else {}
     rows = []
-    for idx, (name, cur_bal, tgt) in enumerate(conn.execute(
-        "SELECT name, current_balance, target_amount FROM savings_pockets"
-    )):
-        last_dep = last_vals[idx] if idx < len(last_vals) else 0.0
-        falt_sav = "" if tgt is None else format_money(max(tgt - cur_bal, 0.0))
+    for s in db.collection("savings_pockets").stream():
+        d = s.to_dict()
+        name, bal, tgt = d["name"], float(d["current_balance"]), d.get("target_amount")
+        key = f"to_savings_{name.lower()}"
+        last_dep = last_vals.get(key, 0.0)
+        falt_sav = "" if tgt is None else format_money(max(tgt - bal, 0.0))
         rows.append({
             "Descripción":     name,
             "Monto Meta":      "" if tgt is None else format_money(tgt),
-            "Dinero Actual":   format_money(cur_bal),
+            "Dinero Actual":   format_money(bal),
             "Último Depósito": format_money(last_dep),
             "Faltante":        falt_sav
         })
+    st.table(pd.DataFrame(rows))
 
-    df_sav = pd.DataFrame(rows)
-    st.table(df_sav)
-
-    # 💳 Tarjetas de Crédito
-    st.subheader("💳 Tarjetas de Crédito")
+    # 💳 TARJETAS DE CRÉDITO
+    st.subheader("💳 TARJETAS DE CRÉDITO")
+    last_details = allocs[-1].to_dict().get("debt_details", {}) if allocs else {}
     rows = []
-    for name, bal, pay in conn.execute("SELECT name, total_balance, min_payment FROM debts"):
+    for dref in db.collection("debts").stream():
+        d = dref.to_dict()
+        name, bal = d["name"], float(d["total_balance"])
+        paid_total = sum(
+            a.to_dict().get("debt_details", {}).get(name, 0.0)
+            for a in allocs
+        )
+        last_dep = last_details.get(name, 0.0)
+        initial = paid_total + bal
         rows.append({
             "Descripción":     name,
-            "Monto Deuda":     format_money(bal),
-            "Dinero Actual":   format_money(pay),
-            "Último Depósito": format_money(pay),
+            "Monto Meta":      format_money(initial),
+            "Dinero Actual":   format_money(paid_total),
+            "Último Depósito": format_money(last_dep),
             "Faltante":        format_money(bal)
         })
-    df_deb = pd.DataFrame(rows)
-    st.table(df_deb)
-
-    conn.close()
+    st.table(pd.DataFrame(rows))
 
 if __name__ == "__main__":
     main()
