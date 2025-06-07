@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # streamlit_app.py
 
+import json
 import streamlit as st
 from datetime import datetime
 import firebase_admin
@@ -10,13 +11,19 @@ import pandas as pd
 
 # --- Inicializar Firestore SOLO desde Secrets ---
 if "db" not in st.session_state:
-    svc = st.secrets["FIREBASE_KEY"]  # must be set in Streamlit Secrets
-    cred = credentials.Certificate(svc)
+    # FIREBASE_KEY debe contener todo el JSON como string
+    svc = st.secrets["FIREBASE_KEY"]
+    # si es string, parsear a dict
+    if isinstance(svc, str):
+        svc_dict = json.loads(svc)
+    else:
+        svc_dict = svc
+    cred = credentials.Certificate(svc_dict)
     firebase_admin.initialize_app(cred)
     st.session_state.db = firestore.client()
 db = st.session_state.db
 
-# --- Página ---
+# --- Configuración de la página ---
 st.set_page_config(page_title="Gestor de Finanzas Semanales", layout="wide")
 
 FIXED_MONTHLY_META    = 2600.0
@@ -36,20 +43,20 @@ def format_money(x):
 
 def allocate_income(amount: float):
     today = datetime.now().strftime("%Y-%m-%d")
-    # 1) Register income
+    # 1) Registrar ingreso
     inc_ref = db.collection("incomes").add({
         "date": today, "amount": amount, "source": "Real"
     })
     inc_id = inc_ref[1].id
 
-    # 2) Cover fixed expenses
+    # 2) Cubrir gastos fijos
     spent_fixed = sum(a.to_dict().get("to_expenses",0.0)
                       for a in db.collection("allocations").stream())
     to_exp = min(amount, FIXED_MONTHLY_META - spent_fixed) \
              if spent_fixed < FIXED_MONTHLY_META else 0.0
     rem = amount - to_exp
 
-    # 3) Savings (70% of remainder)
+    # 3) Ahorros (70% del sobrante)
     to_sav = rem * 0.70
     sav_dep = {}
     for name, w in SAVINGS_WEIGHTS.items():
@@ -57,11 +64,10 @@ def allocate_income(amount: float):
         docs = list(db.collection("savings_pockets")
                     .where(filter=FieldFilter("name","==",name))
                     .stream())
-        if not docs: continue
-        ref = docs[0]
-        d = ref.to_dict()
-        bal = float(d.get("current_balance",0.0))
-        tgt = d.get("target_amount")
+        if not docs:
+            continue
+        ref = docs[0]; d = ref.to_dict()
+        bal = float(d.get("current_balance",0.0)); tgt = d.get("target_amount")
         if name in ("Savings","INVEST"):
             pay = alloc
         else:
@@ -76,7 +82,7 @@ def allocate_income(amount: float):
     used_sav = sum(sav_dep.values())
     debt_pool = rem * 0.30 + (to_sav - used_sav)
 
-    # 4) Pay Upstart (monthly cap)
+    # 4) Pago a Upstart (límite mensual)
     paid_up = sum(a.to_dict().get("to_upstart",0.0)
                   for a in db.collection("allocations").stream())
     avail_up = max(UPSTART_MONTHLY_LIMIT - paid_up, 0.0)
@@ -90,7 +96,7 @@ def allocate_income(amount: float):
         })
     debt_left = debt_pool - up_pay
 
-    # 5) Remaining debts (filtered in Python)
+    # 5) Resto de deudas (filtrado en Python)
     all_debts = db.collection("debts").stream()
     debt_docs = [
         d for d in all_debts
@@ -109,12 +115,12 @@ def allocate_income(amount: float):
             })
         debt_dep[data["name"]] = pay
 
-    # 6) Save allocation with debt details
+    # 6) Guardar allocation con detalles de deuda
     db.collection("allocations").add({
-        "income_id":      inc_id,
-        "to_expenses":    to_exp,
-        "to_upstart":     up_pay,
-        "to_debts":       sum(v for k,v in debt_dep.items() if k!="Upstart"),
+        "income_id":        inc_id,
+        "to_expenses":      to_exp,
+        "to_upstart":       up_pay,
+        "to_debts":         sum(v for k,v in debt_dep.items() if k!="Upstart"),
         "to_savings_car":    sav_dep.get("CAR",0.0),
         "to_savings_rent":   sav_dep.get("RENT",0.0),
         "to_savings_invest": sav_dep.get("INVEST",0.0),
@@ -124,7 +130,7 @@ def allocate_income(amount: float):
     return to_exp, sav_dep, debt_dep
 
 def main():
-    # Month state
+    # Estado del mes
     if "month_idx" not in st.session_state:
         st.session_state.month_idx = datetime.now().month
 
@@ -132,15 +138,15 @@ def main():
     mes = MONTH_NAMES[(st.session_state.month_idx-1)%12]
     st.markdown(f"## Mes: **{mes}**")
 
-    # Reset month
+    # Reiniciar mes
     if st.sidebar.button("Iniciar Nuevo Mes"):
         for a in db.collection("allocations").stream():
             db.collection("allocations").document(a.id).delete()
         st.session_state.month_idx = (st.session_state.month_idx%12)+1
-        st.sidebar.success(f"✅ Reiniciado a {MONTH_NAMES[st.session_state.month_idx-1]}")
+        st.sidebar.success(f"✅ Mes reiniciado a {MONTH_NAMES[st.session_state.month_idx-1]}")
 
-    # Income input
-    inc = st.sidebar.number_input("Monto recibido esta semana",min_value=0.0,step=10.0)
+    # Input y distribución
+    inc = st.sidebar.number_input("Monto recibido esta semana", min_value=0.0, step=10.0)
     if st.sidebar.button("Distribuir Ingreso"):
         to_exp, sav_dep, debt_dep = allocate_income(inc)
         st.sidebar.write(f"- **Gasto Fijo**: {format_money(to_exp)}")
@@ -151,7 +157,7 @@ def main():
         for k,v in debt_dep.items():
             st.sidebar.write(f"  - {k}: {format_money(v)}")
 
-    # 📌 Fixed Expenses
+    # 📌 GASTOS FIJOS
     st.subheader("📌 GASTOS FIJOS")
     allocs = list(db.collection("allocations").stream())
     spent = sum(a.to_dict().get("to_expenses",0.0) for a in allocs)
@@ -168,7 +174,7 @@ def main():
         df_fixed[col] = df_fixed[col].map(format_money)
     st.table(df_fixed)
 
-    # 💰 Savings
+    # 💰 AHORROS
     st.subheader("💰 AHORROS")
     last_vals = allocs[-1].to_dict() if allocs else {}
     rows = []
@@ -187,7 +193,7 @@ def main():
         })
     st.table(pd.DataFrame(rows))
 
-    # 💳 Credit Cards
+    # 💳 TARJETAS DE CRÉDITO
     st.subheader("💳 TARJETAS DE CRÉDITO")
     last_details = allocs[-1].to_dict().get("debt_details",{}) if allocs else {}
     rows=[]
@@ -206,5 +212,5 @@ def main():
         })
     st.table(pd.DataFrame(rows))
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
