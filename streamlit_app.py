@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # streamlit_app.py
 
-import json
 import streamlit as st
+import json
 from datetime import datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -11,13 +11,16 @@ import pandas as pd
 
 # --- Inicializar Firestore SOLO desde Secrets ---
 if "db" not in st.session_state:
-    # FIREBASE_KEY debe contener todo el JSON como string
-    svc = st.secrets["FIREBASE_KEY"]
-    # si es string, parsear a dict
-    if isinstance(svc, str):
-        svc_dict = json.loads(svc)
-    else:
-        svc_dict = svc
+    # Leer la sección FIREBASE_KEY de st.secrets como dict puro
+    svc_raw = st.secrets["FIREBASE_KEY"]
+    svc_dict = dict(svc_raw)          # convierte SecretMap a dict nativo
+    # Si alguna clave viene serializada como JSON string, deserializa:
+    for k, v in svc_dict.items():
+        if isinstance(v, str) and v.strip().startswith("{"):
+            try:
+                svc_dict[k] = json.loads(v)
+            except:
+                pass
     cred = credentials.Certificate(svc_dict)
     firebase_admin.initialize_app(cred)
     st.session_state.db = firestore.client()
@@ -48,14 +51,12 @@ def allocate_income(amount: float):
         "date": today, "amount": amount, "source": "Real"
     })
     inc_id = inc_ref[1].id
-
     # 2) Cubrir gastos fijos
     spent_fixed = sum(a.to_dict().get("to_expenses",0.0)
                       for a in db.collection("allocations").stream())
     to_exp = min(amount, FIXED_MONTHLY_META - spent_fixed) \
              if spent_fixed < FIXED_MONTHLY_META else 0.0
     rem = amount - to_exp
-
     # 3) Ahorros (70% del sobrante)
     to_sav = rem * 0.70
     sav_dep = {}
@@ -64,8 +65,7 @@ def allocate_income(amount: float):
         docs = list(db.collection("savings_pockets")
                     .where(filter=FieldFilter("name","==",name))
                     .stream())
-        if not docs:
-            continue
+        if not docs: continue
         ref = docs[0]; d = ref.to_dict()
         bal = float(d.get("current_balance",0.0)); tgt = d.get("target_amount")
         if name in ("Savings","INVEST"):
@@ -78,10 +78,8 @@ def allocate_income(amount: float):
                 "current_balance": firestore.Increment(pay)
             })
         sav_dep[name] = pay
-
     used_sav = sum(sav_dep.values())
     debt_pool = rem * 0.30 + (to_sav - used_sav)
-
     # 4) Pago a Upstart (límite mensual)
     paid_up = sum(a.to_dict().get("to_upstart",0.0)
                   for a in db.collection("allocations").stream())
@@ -95,7 +93,6 @@ def allocate_income(amount: float):
             "total_balance": firestore.Increment(-up_pay)
         })
     debt_left = debt_pool - up_pay
-
     # 5) Resto de deudas (filtrado en Python)
     all_debts = db.collection("debts").stream()
     debt_docs = [
@@ -106,16 +103,14 @@ def allocate_income(amount: float):
     total_bal = sum(float(d.to_dict().get("total_balance",0.0)) for d in debt_docs)
     debt_dep = {"Upstart": up_pay}
     for ref in debt_docs:
-        data = ref.to_dict()
-        bal = float(data["total_balance"])
+        data = ref.to_dict(); bal = float(data["total_balance"])
         pay = min((bal/total_bal)*debt_left if total_bal>0 else 0.0, bal)
         if pay>0:
             db.collection("debts").document(ref.id).update({
                 "total_balance": firestore.Increment(-pay)
             })
         debt_dep[data["name"]] = pay
-
-    # 6) Guardar allocation con detalles de deuda
+    # 6) Guardar allocation con detalles
     db.collection("allocations").add({
         "income_id":        inc_id,
         "to_expenses":      to_exp,
@@ -130,23 +125,18 @@ def allocate_income(amount: float):
     return to_exp, sav_dep, debt_dep
 
 def main():
-    # Estado del mes
     if "month_idx" not in st.session_state:
         st.session_state.month_idx = datetime.now().month
-
     st.title("🗂️ Gestor de Finanzas Semanales")
     mes = MONTH_NAMES[(st.session_state.month_idx-1)%12]
     st.markdown(f"## Mes: **{mes}**")
-
-    # Reiniciar mes
     if st.sidebar.button("Iniciar Nuevo Mes"):
         for a in db.collection("allocations").stream():
             db.collection("allocations").document(a.id).delete()
         st.session_state.month_idx = (st.session_state.month_idx%12)+1
         st.sidebar.success(f"✅ Mes reiniciado a {MONTH_NAMES[st.session_state.month_idx-1]}")
 
-    # Input y distribución
-    inc = st.sidebar.number_input("Monto recibido esta semana", min_value=0.0, step=10.0)
+    inc = st.sidebar.number_input("Monto recibido esta semana",min_value=0.0,step=10.0)
     if st.sidebar.button("Distribuir Ingreso"):
         to_exp, sav_dep, debt_dep = allocate_income(inc)
         st.sidebar.write(f"- **Gasto Fijo**: {format_money(to_exp)}")
@@ -157,58 +147,55 @@ def main():
         for k,v in debt_dep.items():
             st.sidebar.write(f"  - {k}: {format_money(v)}")
 
-    # 📌 GASTOS FIJOS
     st.subheader("📌 GASTOS FIJOS")
     allocs = list(db.collection("allocations").stream())
     spent = sum(a.to_dict().get("to_expenses",0.0) for a in allocs)
     last_exp = allocs[-1].to_dict().get("to_expenses",0.0) if allocs else 0.0
     falt = max(FIXED_MONTHLY_META - spent,0.0)
     df_fixed = pd.DataFrame([{
-        "Descripción":     "Gasto Fijo Mensual",
-        "Monto Meta":      FIXED_MONTHLY_META,
-        "Dinero Actual":   spent,
-        "Último Depósito": last_exp,
-        "Faltante":        falt
+        "Descripción":"Gasto Fijo Mensual",
+        "Monto Meta":FIXED_MONTHLY_META,
+        "Dinero Actual":spent,
+        "Último Depósito":last_exp,
+        "Faltante":falt
     }])
     for col in df_fixed.columns[1:]:
-        df_fixed[col] = df_fixed[col].map(format_money)
+        df_fixed[col]=df_fixed[col].map(format_money)
     st.table(df_fixed)
 
-    # 💰 AHORROS
     st.subheader("💰 AHORROS")
     last_vals = allocs[-1].to_dict() if allocs else {}
-    rows = []
+    rows=[]
     for s in db.collection("savings_pockets").stream():
-        d = s.to_dict()
+        d=s.to_dict()
         name, bal, tgt = d["name"], float(d["current_balance"]), d.get("target_amount")
-        key = f"to_savings_{name.lower()}"
-        last_dep = last_vals.get(key,0.0)
-        falt_sav = "" if tgt is None else format_money(max(tgt-bal,0.0))
+        key=f"to_savings_{name.lower()}"
+        last_dep=last_vals.get(key,0.0)
+        falt_sav="" if tgt is None else format_money(max(tgt-bal,0.0))
         rows.append({
-            "Descripción":     name,
-            "Monto Meta":      "" if tgt is None else format_money(tgt),
-            "Dinero Actual":   format_money(bal),
-            "Último Depósito": format_money(last_dep),
-            "Faltante":        falt_sav
+            "Descripción":name,
+            "Monto Meta":"" if tgt is None else format_money(tgt),
+            "Dinero Actual":format_money(bal),
+            "Último Depósito":format_money(last_dep),
+            "Faltante":falt_sav
         })
     st.table(pd.DataFrame(rows))
 
-    # 💳 TARJETAS DE CRÉDITO
     st.subheader("💳 TARJETAS DE CRÉDITO")
-    last_details = allocs[-1].to_dict().get("debt_details",{}) if allocs else {}
+    last_details=allocs[-1].to_dict().get("debt_details",{}) if allocs else {}
     rows=[]
     for dref in db.collection("debts").stream():
-        d = dref.to_dict()
-        name, bal = d["name"], float(d["total_balance"])
-        paid_total = sum(a.to_dict().get("debt_details",{}).get(name,0.0) for a in allocs)
-        last_dep = last_details.get(name,0.0)
-        initial = paid_total + bal
+        d=dref.to_dict()
+        name,bal=d["name"],float(d["total_balance"])
+        paid_total=sum(a.to_dict().get("debt_details",{}).get(name,0.0) for a in allocs)
+        last_dep=last_details.get(name,0.0)
+        initial=paid_total+bal
         rows.append({
-            "Descripción":     name,
-            "Monto Meta":      format_money(initial),
-            "Dinero Actual":   format_money(paid_total),
-            "Último Depósito": format_money(last_dep),
-            "Faltante":        format_money(bal)
+            "Descripción":name,
+            "Monto Meta":format_money(initial),
+            "Dinero Actual":format_money(paid_total),
+            "Último Depósito":format_money(last_dep),
+            "Faltante":format_money(bal)
         })
     st.table(pd.DataFrame(rows))
 
